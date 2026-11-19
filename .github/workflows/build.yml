@@ -1,0 +1,117 @@
+name: 编译去掉OpenMP的ncnn库
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库（空仓库，仅用于存放本配置）
+        uses: actions/checkout@v4
+
+      - name: 下载 sherpa-ncnn v2.1.15 源码
+        run: |
+          git clone --depth 1 --branch v2.1.15 https://github.com/k2-fsa/sherpa-ncnn.git
+          echo "===== 确认锁定的 ncnn 版本（必须 c4193aad）====="
+          grep -E 'ncnn_URL|ncnn_HASH' sherpa-ncnn/cmake/ncnn.cmake | head -4
+
+      - name: 编译 arm64-v8a（关 OpenMP）
+        run: |
+          cd sherpa-ncnn
+          export ANDROID_NDK=$ANDROID_NDK_LATEST_HOME
+          mkdir -p build-android-arm64-v8a
+          cd build-android-arm64-v8a
+          cmake -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=ON \
+              -DSHERPA_NCNN_ENABLE_PORTAUDIO=OFF \
+              -DSHERPA_NCNN_ENABLE_BINARY=OFF \
+              -DSHERPA_NCNN_ENABLE_TEST=OFF \
+              -DSHERPA_NCNN_ENABLE_C_API=OFF \
+              -DSHERPA_NCNN_ENABLE_GENERATE_INT8_SCALE_TABLE=OFF \
+              -DCMAKE_INSTALL_PREFIX=./install \
+              -DANDROID_ABI="arm64-v8a" \
+              -DANDROID_PLATFORM=android-21 \
+              -DNCNN_OPENMP=OFF \
+              -DNCNN_VULKAN=OFF \
+              ..
+          make -j$(nproc)
+          make install/strip
+
+      - name: 编译 armeabi-v7a（关 OpenMP）
+        run: |
+          cd sherpa-ncnn
+          export ANDROID_NDK=$ANDROID_NDK_LATEST_HOME
+          mkdir -p build-android-armv7-eabi
+          cd build-android-armv7-eabi
+          cmake -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=ON \
+              -DSHERPA_NCNN_ENABLE_PORTAUDIO=OFF \
+              -DSHERPA_NCNN_ENABLE_BINARY=OFF \
+              -DSHERPA_NCNN_ENABLE_TEST=OFF \
+              -DSHERPA_NCNN_ENABLE_C_API=OFF \
+              -DSHERPA_NCNN_ENABLE_GENERATE_INT8_SCALE_TABLE=OFF \
+              -DCMAKE_INSTALL_PREFIX=./install \
+              -DANDROID_ABI="armeabi-v7a" \
+              -DANDROID_ARM_NEON=ON \
+              -DANDROID_PLATFORM=android-21 \
+              -DNCNN_OPENMP=OFF \
+              -DNCNN_VULKAN=OFF \
+              ..
+          make -j$(nproc)
+          make install/strip
+
+      - name: 验收（OpenMP 必须彻底去掉，否则直接失败）
+        run: |
+          set -e
+          for ABI in arm64-v8a armv7-eabi; do
+            SO="sherpa-ncnn/build-android-${ABI}/install/lib/libncnn.so"
+            echo "=================================================="
+            echo "ABI = ${ABI}，产物大小："
+            ls -lh "$SO"
+            echo "---- ① __kmp 符号数（必须为 0）----"
+            KMP=$(strings "$SO" | grep -c __kmp || true)
+            echo "__kmp = $KMP"
+            if [ "$KMP" != "0" ]; then
+              echo "!!! ${ABI} 仍带 OpenMP（__kmp=$KMP），验收不通过" >&2
+              exit 1
+            fi
+            echo "---- ② OpenMP runtime 文案数（必须为 0）----"
+            OMP=$(strings "$SO" | grep -c "OpenMP runtime" || true)
+            echo "OpenMP runtime = $OMP"
+            if [ "$OMP" != "0" ]; then
+              echo "!!! ${ABI} 还有 OpenMP 运行时文案，验收不通过" >&2
+              exit 1
+            fi
+            echo "---- ③ 动态依赖里的 libomp（必须为空）----"
+            readelf -d "$SO" | grep -i libomp && echo "!!! 出现 libomp，验收不通过" && exit 1 || echo "（无 libomp，合格）"
+            echo "---- ④ 关键 ncnn 接口是否齐全 ----"
+            SYMS=$(readelf --dyn-syms -W "$SO")
+            echo "导出 ncnn 符号总数：$(echo "$SYMS" | grep -c '_ZN4ncnn' || true)"
+            for sym in "_ZN4ncnn3Net10load_param" "_ZN4ncnn3Net10load_model" "_ZN4ncnn9Extractor7extract" "_ZN4ncnn23cast_float32_to_float16"; do
+              if echo "$SYMS" | grep -q "$sym"; then
+                echo "  有：$sym"
+              else
+                echo "!!! 缺符号：$sym，验收不通过" >&2
+                exit 1
+              fi
+            done
+          done
+          echo "=================================================="
+          echo "全部验收通过：OpenMP 已彻底去掉，关键接口齐全。"
+
+      - name: 收集产物（只取 libncnn.so）
+        run: |
+          mkdir -p jniLibs/arm64-v8a jniLibs/armeabi-v7a
+          cp -v sherpa-ncnn/build-android-arm64-v8a/install/lib/libncnn.so jniLibs/arm64-v8a/
+          cp -v sherpa-ncnn/build-android-armv7-eabi/install/lib/libncnn.so jniLibs/armeabi-v7a/
+          ls -lh jniLibs/arm64-v8a/ jniLibs/armeabi-v7a/
+
+      - name: 打包上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncnn-无OpenMP库
+          path: ./jniLibs
+          retention-days: 7
